@@ -61,7 +61,7 @@ In the `/docs` folder you will find more detailed instructions.
 
 ### Configure Claude MCP
 
-Refer to `server.ts`
+For MCP tool names and breaking changes in 1.0.0, see `CHANGELOG.md`. Implementation lives in `src/server.ts`.
 
 1. Build the project using `npm run build`
 2. Navigate to `Settings -> Developer -> Edit Config`
