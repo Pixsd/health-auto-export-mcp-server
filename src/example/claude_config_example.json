@@ -1,8 +1,0 @@
-{
-  "mcpServers": {
-    "health_auto_export": {
-      "command": "node",
-      "args": ["/Users/username/Desktop/hae-mcp/dist/server.js"]
-    }
-  }
-}
