@@ -1,31 +1,31 @@
 {
-  "name": "node-mcp",
-  "version": "1.0.0",
-  "type": "module",
-  "main": "dist/server.js",
-  "scripts": {
-    "test": "test",
-    "start": "node dist/server.js",
-    "dev": "node --loader ts-node/esm src/server.ts",
-    "build": "tsc && chmod 755 dist/server.js"
-  },
-  "author": "",
-  "license": "MIT",
-  "description": "",
-  "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.17.4",
-    "dotenv": "^16.4.5",
-    "zod": "^3.25.76"
-  },
-  "devDependencies": {
-    "@types/node": "^24.3.0",
-    "ts-node": "^10.9.2",
-    "typescript": "^5.9.2"
-  },
-  "bin": {
-    "health_auto_export": "./dist/server.js"
-  },
-  "files": [
-    "dist"
-  ]
+    "name": "node-mcp",
+    "version": "1.0.0",
+    "type": "module",
+    "main": "dist/server.js",
+    "scripts": {
+        "test": "test",
+        "start": "node dist/server.js",
+        "dev": "node --loader ts-node/esm src/server.ts",
+        "build": "tsc && chmod 755 dist/server.js"
+    },
+    "author": "",
+    "license": "MIT",
+    "description": "",
+    "dependencies": {
+        "@modelcontextprotocol/sdk": "^1.17.4",
+        "dotenv": "^16.4.5",
+        "zod": "^3.25.76"
+    },
+    "devDependencies": {
+        "@types/node": "^24.3.0",
+        "ts-node": "^10.9.2",
+        "typescript": "^5.9.2"
+    },
+    "bin": {
+        "health_auto_export": "./dist/server.js"
+    },
+    "files": [
+        "dist"
+    ]
 }
