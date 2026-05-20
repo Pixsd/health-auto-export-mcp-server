@@ -4,6 +4,7 @@ import { registerRestingHrTool } from './restingHr.js';
 import { registerMaxHrTool } from './maxHr.js';
 import { registerWorkoutZonesTool } from './workoutZones.js';
 import { registerTrimpTool } from './trimp.js';
+import { registerProfileTool } from './profile.js';
 
 export function registerAllTools(server: McpServer): void {
     registerProxyTools(server);
@@ -11,4 +12,5 @@ export function registerAllTools(server: McpServer): void {
     registerMaxHrTool(server);
     registerWorkoutZonesTool(server);
     registerTrimpTool(server);
+    registerProfileTool(server);
 }

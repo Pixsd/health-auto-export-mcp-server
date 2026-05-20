@@ -22,16 +22,22 @@ export async function upsertMaxHrSnapshot(
 
 /**
  * Finds the most recent max-HR snapshot with end_date ≤ `date`, looking back
- * up to 365 days. Returns null if none found.
- *
- * Max HR changes slowly, so a snapshot from up to a year ago is still useful.
+ * up to 365 days. If none found (bootstrap scenario: first snapshot was computed
+ * today but workouts predate it), falls back to the closest available snapshot
+ * overall — max HR changes ~1 bpm/year so a recent-future snapshot is valid.
  */
 export async function getMaxHrForDate(date: string): Promise<MaxHrSnapshotDoc | null> {
     const col = (await getDb()).collection<MaxHrSnapshotDoc>(COL);
     const cutoff = new Date(date);
     cutoff.setDate(cutoff.getDate() - 365);
-    return col.findOne(
+
+    // Primary: snapshot that existed on or before the workout date.
+    const prior = await col.findOne(
         { end_date: { $gte: cutoff.toISOString().slice(0, 10), $lte: date } },
         { sort: { end_date: -1 } },
     );
+    if (prior) return prior;
+
+    // Fallback: most recent snapshot overall (handles bootstrap / first-run).
+    return col.findOne({}, { sort: { end_date: -1 } });
 }
