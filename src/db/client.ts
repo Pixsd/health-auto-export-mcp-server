@@ -3,13 +3,18 @@ import { MONGODB_URI } from '../config.js';
 
 let _client: MongoClient | null = null;
 let _db: Db | null = null;
+let _connecting: Promise<Db> | null = null;
 
 export async function getDb(): Promise<Db> {
     if (_db) return _db;
-    _client = new MongoClient(MONGODB_URI);
-    await _client.connect();
-    _db = _client.db();
-    return _db;
+    if (_connecting) return _connecting;
+    _connecting = (async () => {
+        _client = new MongoClient(MONGODB_URI);
+        await _client.connect();
+        _db = _client.db();
+        return _db;
+    })();
+    return _connecting;
 }
 
 export async function closeDb(): Promise<void> {
@@ -17,6 +22,7 @@ export async function closeDb(): Promise<void> {
         await _client.close();
         _client = null;
         _db = null;
+        _connecting = null;
     }
 }
 
