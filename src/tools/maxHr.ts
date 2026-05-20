@@ -2,6 +2,7 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { callTCPRaw } from '../tcp/client.js';
 import { percentile } from '../utils/math.js';
+import { upsertMaxHrSnapshot } from '../db/maxHrStore.js';
 
 export function registerMaxHrTool(server: McpServer): void {
     server.registerTool(
@@ -62,7 +63,8 @@ OUTPUT:
         },
         async ({ age, lookback_days = 90 }) => {
             const now = new Date();
-            const resolvedEnd = `${now.toISOString().slice(0, 10)} 23:59:59 +0000`;
+            const today = now.toISOString().slice(0, 10);
+            const resolvedEnd = `${today} 23:59:59 +0000`;
             const resolvedStart = `${new Date(now.getTime() - lookback_days * 86_400_000).toISOString().slice(0, 10)} 00:00:00 +0000`;
 
             const res = await callTCPRaw('workouts', {
@@ -100,24 +102,20 @@ OUTPUT:
             const fox = 220 - age;
 
             if (workoutPeaks.length === 0) {
+                const result = {
+                    recommended_max_hr_bpm: tanaka,
+                    recommended_source: 'no_data',
+                    measured: null,
+                    formulas: { tanaka_2001: tanaka, fox_1971: fox },
+                    lookback_days,
+                    note: 'No workouts with HR data found. Using Tanaka formula.',
+                };
+                await upsertMaxHrSnapshot(
+                    { _id: today, end_date: today, age, ...result, computed_at: new Date() },
+                    true,
+                );
                 return {
-                    content: [
-                        {
-                            type: 'text' as const,
-                            text: JSON.stringify(
-                                {
-                                    recommended_max_hr_bpm: tanaka,
-                                    recommended_source: 'no_data',
-                                    measured: null,
-                                    formulas: { tanaka_2001: tanaka, fox_1971: fox },
-                                    lookback_days,
-                                    note: 'No workouts with HR data found. Using Tanaka formula.',
-                                },
-                                null,
-                                2,
-                            ),
-                        },
-                    ],
+                    content: [{ type: 'text' as const, text: JSON.stringify(result, null, 2) }],
                 };
             }
 
@@ -126,29 +124,28 @@ OUTPUT:
             const p95 = Math.round(percentile(sortedAsc, 0.95));
 
             const useMeasured = p95 >= tanaka - 5;
+            const measured = {
+                peak_hr_observed_bpm: peakObserved,
+                peak_hr_p95_bpm: p95,
+                workouts_analyzed: workoutPeaks.length,
+                top_5_workouts: workoutPeaks.slice(0, 5),
+            };
+            const result = {
+                recommended_max_hr_bpm: useMeasured ? p95 : tanaka,
+                recommended_source: useMeasured ? 'measured_p95' : 'tanaka_formula',
+                measured,
+                formulas: { tanaka_2001: tanaka, fox_1971: fox },
+                lookback_days,
+            };
+
+            // Save snapshot to MongoDB (today's entry always upserted).
+            await upsertMaxHrSnapshot(
+                { _id: today, end_date: today, age, ...result, computed_at: new Date() },
+                true,
+            );
 
             return {
-                content: [
-                    {
-                        type: 'text' as const,
-                        text: JSON.stringify(
-                            {
-                                recommended_max_hr_bpm: useMeasured ? p95 : tanaka,
-                                recommended_source: useMeasured ? 'measured_p95' : 'tanaka_formula',
-                                measured: {
-                                    peak_hr_observed_bpm: peakObserved,
-                                    peak_hr_p95_bpm: p95,
-                                    workouts_analyzed: workoutPeaks.length,
-                                    top_5_workouts: workoutPeaks.slice(0, 5),
-                                },
-                                formulas: { tanaka_2001: tanaka, fox_1971: fox },
-                                lookback_days,
-                            },
-                            null,
-                            2,
-                        ),
-                    },
-                ],
+                content: [{ type: 'text' as const, text: JSON.stringify(result, null, 2) }],
             };
         },
     );

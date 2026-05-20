@@ -5,7 +5,36 @@ import { parseHAEDate } from '../utils/date.js';
 import { percentile } from '../utils/math.js';
 import { selectSleepIntervals } from '../formulas/sleep.js';
 import type { SleepInterval } from '../formulas/sleep.js';
-import { getRhrCached, setRhrCache, CURRENT_DAY_TTL_MS } from '../cache/rhr.js';
+import { upsertRhrDay, getRhrRange } from '../db/rhrStore.js';
+
+type RhrDayResult = {
+    date: string;
+    rhr_bpm: number;
+    samples_count: number;
+    deep_sleep_minutes: number;
+    method: string;
+};
+
+function buildRhrResponse(
+    validResults: RhrDayResult[],
+): { content: Array<{ type: 'text'; text: string }> } {
+    const summary = {
+        days_with_data: validResults.length,
+        avg_rhr_bpm:
+            validResults.length > 0
+                ? Math.round(
+                    (validResults.reduce((s, r) => s + r.rhr_bpm, 0) / validResults.length) * 10,
+                ) / 10
+                : null,
+        min_rhr_bpm:
+            validResults.length > 0 ? Math.min(...validResults.map((r) => r.rhr_bpm)) : null,
+        max_rhr_bpm:
+            validResults.length > 0 ? Math.max(...validResults.map((r) => r.rhr_bpm)) : null,
+    };
+    return {
+        content: [{ type: 'text', text: JSON.stringify({ summary, daily: validResults }, null, 2) }],
+    };
+}
 
 export function registerRestingHrTool(server: McpServer): void {
     server.registerTool(
@@ -66,9 +95,24 @@ RECOMMENDED USE:
             },
         },
         async ({ start, end }) => {
-            const cacheKey = `${start}|${end}`;
-            const cached = getRhrCached(cacheKey);
-            if (cached) return cached;
+            const today = new Date().toISOString().slice(0, 10);
+            const startDay = start.slice(0, 10);
+            const endDay = end.slice(0, 10);
+
+            // Fast path: if the entire range is historical and already in DB, skip HAE.
+            if (endDay < today) {
+                const cached = await getRhrRange(startDay, endDay);
+                if (cached.length > 0) {
+                    const validResults = cached.map((d) => ({
+                        date: d.date,
+                        rhr_bpm: d.rhr_bpm,
+                        samples_count: d.samples_count,
+                        deep_sleep_minutes: d.deep_sleep_minutes,
+                        method: d.method,
+                    }));
+                    return buildRhrResponse(validResults);
+                }
+            }
 
             // Fetch raw HR samples and sleep analysis in parallel.
             // IMPORTANT: HAE groups sleep stages by the session's *start night*, so a session
@@ -156,48 +200,27 @@ RECOMMENDED USE:
                     };
                 });
 
-            const daysWithoutSamples = results
-                .filter((r) => r.samples_count === 0)
-                .map((r) => r.date);
             const validResults = results.filter((r) => r.samples_count > 0);
 
-            const summary = {
-                days_with_data: validResults.length,
-                days_without_data: daysWithoutSamples,
-                avg_rhr_bpm:
-                    validResults.length > 0
-                        ? Math.round(
-                            (validResults.reduce((s, r) => s + r.rhr_bpm, 0) /
-                                validResults.length) *
-                            10,
-                        ) / 10
-                        : null,
-                min_rhr_bpm:
-                    validResults.length > 0
-                        ? Math.min(...validResults.map((r) => r.rhr_bpm))
-                        : null,
-                max_rhr_bpm:
-                    validResults.length > 0
-                        ? Math.max(...validResults.map((r) => r.rhr_bpm))
-                        : null,
-            };
+            // Persist to MongoDB: insert-only for past days, upsert for today.
+            await Promise.all(
+                validResults.map((r) =>
+                    upsertRhrDay(
+                        {
+                            _id: r.date,
+                            date: r.date,
+                            rhr_bpm: r.rhr_bpm,
+                            samples_count: r.samples_count,
+                            deep_sleep_minutes: r.deep_sleep_minutes,
+                            method: r.method,
+                            computed_at: new Date(),
+                        },
+                        r.date >= today,
+                    ),
+                ),
+            );
 
-            const response = {
-                content: [
-                    {
-                        type: 'text' as const,
-                        text: JSON.stringify({ summary, daily: validResults }, null, 2),
-                    },
-                ],
-            };
-
-            // Cache: past queries forever, queries including today for 30 minutes.
-            const today = new Date().toISOString().slice(0, 10);
-            const endDay = end.slice(0, 10);
-            const ttl = endDay >= today ? CURRENT_DAY_TTL_MS : Infinity;
-            setRhrCache(cacheKey, response, ttl);
-
-            return response;
+            return buildRhrResponse(validResults);
         },
     );
 }

@@ -1,8 +1,13 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { callTCPRaw } from '../tcp/client.js';
-import { parseHAEDate } from '../utils/date.js';
-import { TRIMP_ZONE_PARAMS, calcWorkoutZoneSec } from '../formulas/workout.js';
+import {
+    getProcessedWorkouts,
+    saveProcessedWorkout,
+    batchResolveHrParams,
+    computeWorkoutDoc,
+} from '../db/workoutStore.js';
+import type { WorkoutProcessedDoc } from '../db/types.js';
 
 export function registerTrimpTool(server: McpServer): void {
     server.registerTool(
@@ -29,13 +34,18 @@ FORMULA (zone-weighted variant):
     pct = (hr_sample_avg - rhr) / (max_hr - rhr)
   Time below RHR (pct < 0) is excluded from the TRIMP calculation.
 
-REQUIRED INPUTS:
-  - max_hr : maximum heart rate in bpm (use 220 - age as estimate).
-  - rhr    : resting heart rate in bpm (use get_resting_heart_rate for accuracy).
+HR PARAMETERS (rhr / max_hr):
+  These are now OPTIONAL. When omitted, the tool automatically resolves the
+  most appropriate historical values from the database:
+  - rhr    : closest RHR entry on or before the workout date (within 30 days).
+  - max_hr : closest max-HR snapshot on or before the workout date (within 365 days).
+  If no DB value is available, provide a fallback here.
 
 OUTPUT:
   - Per workout: id, name, start, duration_min, trimp, zones_min (breakdown for audit)
   - Summary: total_trimp, workout_count, avg_trimp_per_workout
+  - rhr_used, max_hr_used, rhr_source, max_hr_source (actual values used)
+  - cached: true if the result was served from the database
   - Workouts with no heartRateData get trimp = null.
 
 INTERPRETATION:
@@ -66,20 +76,22 @@ INTERPRETATION:
                     ),
                 max_hr: z
                     .number()
+                    .optional()
                     .describe(
-                        'Maximum heart rate in bpm (e.g. 185). Use 220 - age as estimate if unknown.',
+                        'Fallback maximum heart rate in bpm. Used only if no DB snapshot exists for the workout date.',
                     ),
                 rhr: z
                     .number()
+                    .optional()
                     .describe(
-                        'Resting heart rate in bpm. Call get_resting_heart_rate first for best accuracy.',
+                        'Fallback resting heart rate in bpm. Used only if no DB entry exists for the workout date.',
                     ),
             },
         },
         async ({ start, end, workout_id, max_hr, rhr }) => {
             const now = new Date();
-            const resolvedEnd =
-                end ?? `${now.toISOString().slice(0, 10)} 23:59:59 +0000`;
+            const today = now.toISOString().slice(0, 10);
+            const resolvedEnd = end ?? `${today} 23:59:59 +0000`;
             const resolvedStart =
                 start ??
                 `${new Date(now.getTime() - 365 * 86_400_000).toISOString().slice(0, 10)} 00:00:00 +0000`;
@@ -96,60 +108,65 @@ INTERPRETATION:
             const workouts = workout_id
                 ? allWorkouts.filter((w: any) => w.id === workout_id)
                 : allWorkouts;
-            const reserve = max_hr - rhr;
 
+            // ── Batch-fetch cached results for past workouts ───────────────────────────
+            const pastIds = workouts
+                .filter((w: any) => (w.start as string).slice(0, 10) < today)
+                .map((w: any) => w.id as string);
+            const cachedMap = await getProcessedWorkouts(pastIds);
+
+            // ── Resolve HR params for uncached workouts (batch) ───────────────────────
+            const toProcess = workouts.filter((w: any) => !cachedMap.has(w.id as string));
+            const hrParamsMap = await batchResolveHrParams(
+                toProcess.map((w: any) => (w.start as string).slice(0, 10)),
+                rhr,
+                max_hr,
+            );
+
+            // ── Compute and persist ───────────────────────────────────────────────────
+            const computedMap = new Map<string, WorkoutProcessedDoc>();
+            await Promise.all(
+                toProcess.map(async (w: any) => {
+                    const workoutDate = (w.start as string).slice(0, 10);
+                    const hrParams = hrParamsMap.get(workoutDate);
+                    if (!hrParams) return;
+                    const doc = computeWorkoutDoc(w, hrParams);
+                    computedMap.set(w.id as string, doc);
+                    const isToday = workoutDate >= today;
+                    await saveProcessedWorkout(doc, isToday);
+                }),
+            );
+
+            // ── Build response ────────────────────────────────────────────────────────
             const results = workouts.map((w: any) => {
-                const samples: Array<{ Avg: number; date: string }> =
-                    w.heartRateData ?? [];
+                const id = w.id as string;
+                const doc = cachedMap.get(id) ?? computedMap.get(id);
 
-                if (samples.length === 0) {
+                if (!doc) {
                     return {
-                        id: w.id,
-                        name: w.name,
-                        start: w.start,
+                        id,
+                        name: w.name as string,
+                        start: w.start as string,
                         duration_min: Math.round(((w.duration as number) ?? 0) / 60 * 10) / 10,
                         trimp: null,
                         zones_min: null,
-                        note: 'No heartRateData available',
+                        note: 'Cannot compute: no HR parameters available. Call get_resting_heart_rate and estimate_max_hr first.',
                     };
                 }
 
-                const workoutEndMs = parseHAEDate(w.end as string).getTime();
-                const zoneSec = calcWorkoutZoneSec(samples, workoutEndMs, rhr, reserve);
-
-                const toMin = (s: number): number => Math.round(s / 60 * 10) / 10;
-                const zonesMin = {
-                    z1_min: toMin(zoneSec.z1),
-                    z2_min: toMin(zoneSec.z2),
-                    z3_min: toMin(zoneSec.z3),
-                    z4_min: toMin(zoneSec.z4),
-                    z5_min: toMin(zoneSec.z5),
-                };
-
-                const trimp = parseFloat(
-                    (
-                        Object.entries(TRIMP_ZONE_PARAMS) as Array<
-                            [keyof typeof TRIMP_ZONE_PARAMS, { weight: number; hrr_pct: number }]
-                        >
-                    )
-                        .reduce(
-                            (sum, [zone, p]) =>
-                                sum +
-                                (zonesMin[`${zone}_min` as keyof typeof zonesMin] ?? 0) *
-                                    p.weight *
-                                    p.hrr_pct,
-                            0,
-                        )
-                        .toFixed(1),
-                );
-
                 return {
-                    id: w.id,
-                    name: w.name,
-                    start: w.start,
-                    duration_min: Math.round(((w.duration as number) ?? 0) / 60 * 10) / 10,
-                    trimp,
-                    zones_min: zonesMin,
+                    id: doc._id,
+                    name: doc.name,
+                    start: doc.start,
+                    duration_min: doc.duration_min,
+                    trimp: doc.trimp,
+                    zones_min: doc.zones_min,
+                    rhr_used: doc.rhr_used,
+                    max_hr_used: doc.max_hr_used,
+                    hr_reserve_used: doc.hr_reserve_used,
+                    rhr_source: doc.rhr_source,
+                    max_hr_source: doc.max_hr_source,
+                    cached: cachedMap.has(id),
                 };
             });
 
@@ -164,9 +181,6 @@ INTERPRETATION:
                         type: 'text' as const,
                         text: JSON.stringify(
                             {
-                                max_hr,
-                                rhr,
-                                hr_reserve: reserve,
                                 summary: {
                                     workout_count: results.length,
                                     total_trimp: totalTrimp,
@@ -186,3 +200,4 @@ INTERPRETATION:
         },
     );
 }
+

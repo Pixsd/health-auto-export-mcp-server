@@ -1,8 +1,13 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { callTCPRaw } from '../tcp/client.js';
-import { parseHAEDate } from '../utils/date.js';
-import { calcWorkoutZoneSec } from '../formulas/workout.js';
+import {
+    getProcessedWorkouts,
+    saveProcessedWorkout,
+    batchResolveHrParams,
+    computeWorkoutDoc,
+} from '../db/workoutStore.js';
+import type { WorkoutProcessedDoc } from '../db/types.js';
 
 export function registerWorkoutZonesTool(server: McpServer): void {
     server.registerTool(
@@ -26,23 +31,25 @@ METHODOLOGY (Karvonen / HRR):
   Samples where pct < 0 (HR below RHR, e.g. during warm-up rest) are counted in
   "below_rhr_min".
 
-REQUIRED INPUTS:
-  - max_hr : user's maximum heart rate in bpm.
-             Use 220 - age as a rough estimate, or a field-tested value (e.g. from
-             a max-effort test or the maxHeartRate recorded in a previous hard workout).
-  - rhr    : resting heart rate in bpm.
-             Call get_resting_heart_rate first for a scientifically accurate value,
-             or pass Apple's resting_heart_rate metric from get_health_metrics.
+HR PARAMETERS (rhr / max_hr):
+  These are now OPTIONAL. When omitted, the tool automatically resolves the
+  most appropriate historical values from the database:
+  - rhr    : closest RHR entry on or before the workout date (within 30 days).
+  - max_hr : closest max-HR snapshot on or before the workout date (within 365 days).
+  If no DB value is available, provide a fallback here.
+  Call get_resting_heart_rate and estimate_max_hr to populate the database first.
 
 OUTPUT per workout:
   - id, name, start, duration_min
   - avg_hr, max_hr_recorded
   - zones     : { z1_min, z2_min, z3_min, z4_min, z5_min, below_rhr_min }
-  - zones_pct : same values as % of total tracked time (useful for comparing workouts of different lengths)
-  - method         : "karvonen_hrr"
-  - hr_reserve_used: max_hr - rhr (for auditing)
+  - zones_pct : same values as % of total tracked time
+  - rhr_used, max_hr_used, hr_reserve_used (actual values used for computation)
+  - rhr_source, max_hr_source (e.g. "db:2026-05-01" or "provided")
+  - cached    : true if the result was served from the database
 
-NOTE: Workouts with no heartRateData (Apple Watch not worn) are included with zones = null.`,
+NOTE: Workouts with no heartRateData (Apple Watch not worn) are included with zones = null.
+NOTE: Historical workouts are cached in MongoDB and served instantly on repeated calls.`,
             inputSchema: {
                 start: z
                     .string()
@@ -64,20 +71,22 @@ NOTE: Workouts with no heartRateData (Apple Watch not worn) are included with zo
                     ),
                 max_hr: z
                     .number()
+                    .optional()
                     .describe(
-                        'Maximum heart rate in bpm (e.g. 185). Use 220 - age as estimate if unknown.',
+                        'Fallback maximum heart rate in bpm. Used only if no DB snapshot exists for the workout date.',
                     ),
                 rhr: z
                     .number()
+                    .optional()
                     .describe(
-                        'Resting heart rate in bpm. Call get_resting_heart_rate first for best accuracy.',
+                        'Fallback resting heart rate in bpm. Used only if no DB entry exists for the workout date.',
                     ),
             },
         },
         async ({ start, end, workout_id, max_hr, rhr }) => {
             const now = new Date();
-            const resolvedEnd =
-                end ?? `${now.toISOString().slice(0, 10)} 23:59:59 +0000`;
+            const today = now.toISOString().slice(0, 10);
+            const resolvedEnd = end ?? `${today} 23:59:59 +0000`;
             const resolvedStart =
                 start ??
                 `${new Date(now.getTime() - 365 * 86_400_000).toISOString().slice(0, 10)} 00:00:00 +0000`;
@@ -94,61 +103,68 @@ NOTE: Workouts with no heartRateData (Apple Watch not worn) are included with zo
             const workouts = workout_id
                 ? allWorkouts.filter((w: any) => w.id === workout_id)
                 : allWorkouts;
-            const reserve = max_hr - rhr;
 
+            // ── Batch-fetch cached results for past workouts ───────────────────
+            const pastIds = workouts
+                .filter((w: any) => (w.start as string).slice(0, 10) < today)
+                .map((w: any) => w.id as string);
+            const cachedMap = await getProcessedWorkouts(pastIds);
+
+            // ── Resolve HR params for uncached workouts (batch) ───────────────
+            const toProcess = workouts.filter((w: any) => !cachedMap.has(w.id as string));
+            const hrParamsMap = await batchResolveHrParams(
+                toProcess.map((w: any) => (w.start as string).slice(0, 10)),
+                rhr,
+                max_hr,
+            );
+
+            // ── Compute and persist ───────────────────────────────────────────
+            const computedMap = new Map<string, WorkoutProcessedDoc>();
+            await Promise.all(
+                toProcess.map(async (w: any) => {
+                    const workoutDate = (w.start as string).slice(0, 10);
+                    const hrParams = hrParamsMap.get(workoutDate);
+                    if (!hrParams) return; // no HR data → skip (included in output with note)
+                    const doc = computeWorkoutDoc(w, hrParams);
+                    computedMap.set(w.id as string, doc);
+                    const isToday = workoutDate >= today;
+                    await saveProcessedWorkout(doc, isToday);
+                }),
+            );
+
+            // ── Build response ────────────────────────────────────────────────
             const results = workouts.map((w: any) => {
-                const samples: Array<{ Avg: number; date: string }> =
-                    w.heartRateData ?? [];
+                const id = w.id as string;
+                const doc = cachedMap.get(id) ?? computedMap.get(id);
 
-                if (samples.length === 0) {
+                if (!doc) {
                     return {
-                        id: w.id,
-                        name: w.name,
-                        start: w.start,
-                        duration_min: Math.round(((w.duration as number) ?? 0) / 60 * 10) / 10,
-                        avg_hr: w.avgHeartRate?.qty ?? null,
-                        max_hr_recorded: w.maxHeartRate?.qty ?? null,
+                        id,
+                        name: w.name as string,
+                        start: w.start as string,
+                        duration_min:
+                            Math.round(((w.duration as number) ?? 0) / 60 * 10) / 10,
                         zones: null,
                         zones_pct: null,
-                        method: 'karvonen_hrr',
-                        hr_reserve_used: reserve,
-                        note: 'No heartRateData available',
+                        note: 'Cannot compute: no HR parameters available. Call get_resting_heart_rate and estimate_max_hr first.',
                     };
                 }
 
-                const workoutEndMs = parseHAEDate(w.end as string).getTime();
-                const zoneSec = calcWorkoutZoneSec(samples, workoutEndMs, rhr, reserve);
-
-                const totalSec = Object.values(zoneSec).reduce((a, b) => a + b, 0);
-                const toMin = (s: number): number => Math.round(s / 60 * 10) / 10;
-                const toPct = (s: number): number =>
-                    totalSec > 0 ? Math.round((s / totalSec) * 1000) / 10 : 0;
-
                 return {
-                    id: w.id,
-                    name: w.name,
-                    start: w.start,
-                    duration_min: Math.round(((w.duration as number) ?? 0) / 60 * 10) / 10,
-                    avg_hr: w.avgHeartRate?.qty ?? null,
-                    max_hr_recorded: w.maxHeartRate?.qty ?? null,
-                    zones: {
-                        z1_min: toMin(zoneSec.z1),
-                        z2_min: toMin(zoneSec.z2),
-                        z3_min: toMin(zoneSec.z3),
-                        z4_min: toMin(zoneSec.z4),
-                        z5_min: toMin(zoneSec.z5),
-                        below_rhr_min: toMin(zoneSec.below_rhr),
-                    },
-                    zones_pct: {
-                        z1_pct: toPct(zoneSec.z1),
-                        z2_pct: toPct(zoneSec.z2),
-                        z3_pct: toPct(zoneSec.z3),
-                        z4_pct: toPct(zoneSec.z4),
-                        z5_pct: toPct(zoneSec.z5),
-                        below_rhr_pct: toPct(zoneSec.below_rhr),
-                    },
-                    method: 'karvonen_hrr',
-                    hr_reserve_used: reserve,
+                    id: doc._id,
+                    name: doc.name,
+                    start: doc.start,
+                    duration_min: doc.duration_min,
+                    avg_hr: doc.avg_hr,
+                    max_hr_recorded: doc.max_hr_recorded,
+                    zones: doc.zones,
+                    zones_pct: doc.zones_pct,
+                    rhr_used: doc.rhr_used,
+                    max_hr_used: doc.max_hr_used,
+                    hr_reserve_used: doc.hr_reserve_used,
+                    rhr_source: doc.rhr_source,
+                    max_hr_source: doc.max_hr_source,
+                    cached: cachedMap.has(id),
                 };
             });
 
@@ -157,13 +173,7 @@ NOTE: Workouts with no heartRateData (Apple Watch not worn) are included with zo
                     {
                         type: 'text' as const,
                         text: JSON.stringify(
-                            {
-                                max_hr,
-                                rhr,
-                                hr_reserve: reserve,
-                                workout_count: results.length,
-                                workouts: results,
-                            },
+                            { workout_count: results.length, workouts: results },
                             null,
                             2,
                         ),
