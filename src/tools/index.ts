@@ -6,6 +6,7 @@ import { registerWorkoutZonesTool } from './workoutZones.js';
 import { registerTrimpTool } from './trimp.js';
 import { registerProfileTool } from './profile.js';
 import { registerHrvTool } from './hrv.js';
+import { registerSleepTool } from './sleep.js';
 
 export function registerAllTools(server: McpServer): void {
     registerProxyTools(server);
@@ -15,4 +16,5 @@ export function registerAllTools(server: McpServer): void {
     registerTrimpTool(server);
     registerProfileTool(server);
     registerHrvTool(server);
+    registerSleepTool(server);
 }

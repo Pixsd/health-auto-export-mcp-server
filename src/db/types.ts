@@ -60,6 +60,55 @@ export interface ZonesPctData {
     below_rhr_pct: number;
 }
 
+// ── sleep_nights ──────────────────────────────────────────────────────────────
+// One document per night. _id = "YYYY-MM-DD" of the evening the night started
+// (e.g. "2026-05-20" covers the night 20→21 May). Immutable for past nights.
+export interface SleepStageEntry {
+    start: string;        // "HH:MM" local time
+    end: string;          // "HH:MM" local time
+    stage: string;        // canonical: Core | Deep | REM | Awake | InBed
+    duration_min: number;
+}
+
+export interface SleepHrStats {
+    // Heart rate
+    avg_bpm: number;
+    min_bpm: number;
+    max_bpm: number;
+    per_stage: {
+        deep_avg_bpm: number | null;
+        rem_avg_bpm: number | null;
+        core_avg_bpm: number | null;
+        awake_avg_bpm: number | null;
+    };
+    // Respiratory rate (breaths/min)
+    respiratory_rate_avg_rpm: number | null;
+    respiratory_rate_min_rpm: number | null;
+    respiratory_rate_max_rpm: number | null;
+    // Blood oxygen
+    spo2_avg_pct: number | null;
+    spo2_min_pct: number | null;
+    // HRV RMSSD for this specific night (ms)
+    hrv_rmssd_ms: number | null;
+}
+
+export interface SleepNightDoc {
+    _id: string;               // "YYYY-MM-DD" = evening date
+    date: string;              // "YYYY-MM-DD"
+    sleep_start: string;       // "HH:MM" local time of first non-awake interval
+    sleep_end: string;         // "HH:MM" local time of last interval
+    time_in_bed_min: number;   // from first to last interval
+    total_sleep_min: number;   // Core + Deep + REM
+    deep_min: number;
+    rem_min: number;
+    core_min: number;
+    awake_min: number;
+    efficiency_pct: number;    // total_sleep / time_in_bed * 100
+    timeline: SleepStageEntry[];
+    hr: SleepHrStats | null;
+    fetched_at: Date;
+}
+
 export interface WorkoutProcessedDoc {
     _id: string;              // workout UUID
     workout_date: string;     // "YYYY-MM-DD"
