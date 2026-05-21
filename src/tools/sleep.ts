@@ -324,7 +324,7 @@ export function registerSleepTool(server: McpServer): void {
                 start,
                 end,
                 metrics: metricsToFetch,
-                interval: 'hours',
+                interval: withHr ? 'minutes' : 'hours',
                 aggregate: false,
             });
 
