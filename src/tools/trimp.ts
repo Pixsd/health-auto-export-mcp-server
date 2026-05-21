@@ -74,6 +74,12 @@ INTERPRETATION:
                     .describe(
                         'Filter to a single workout by its UUID (from get_workouts or get_workout_heart_rate_zones). When provided, start/end can be omitted.',
                     ),
+                workout_date: z
+                    .string()
+                    .optional()
+                    .describe(
+                        'Date of the workout in YYYY-MM-DD format. Use together with workout_id to avoid fetching 365 days of data — narrows the TCP request to a single day and avoids timeouts.',
+                    ),
                 max_hr: z
                     .number()
                     .optional()
@@ -88,13 +94,14 @@ INTERPRETATION:
                     ),
             },
         },
-        async ({ start, end, workout_id, max_hr, rhr }) => {
+        async ({ start, end, workout_id, workout_date, max_hr, rhr }) => {
             const now = new Date();
             const today = now.toISOString().slice(0, 10);
-            const resolvedEnd = end ?? `${today} 23:59:59 +0000`;
+            const resolvedEnd = end ?? (workout_date ? `${workout_date} 23:59:59 +0000` : `${today} 23:59:59 +0000`);
             const resolvedStart =
-                start ??
-                `${new Date(now.getTime() - 365 * 86_400_000).toISOString().slice(0, 10)} 00:00:00 +0000`;
+                start ?? (workout_date
+                    ? `${workout_date} 00:00:00 +0000`
+                    : `${new Date(now.getTime() - 365 * 86_400_000).toISOString().slice(0, 10)} 00:00:00 +0000`);
 
             const res = await callTCPRaw('workouts', {
                 start: resolvedStart,
