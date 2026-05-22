@@ -133,7 +133,7 @@ function buildDoc(date: string, raw: RawInterval[]): SleepNightDoc {
 // HR stats computation
 // ---------------------------------------------------------------------------
 
-type HrSample = { date: string; qty: number };
+type HrSample = { date: string; qty?: number; Avg?: number; Min?: number; Max?: number };
 
 interface ExtraVitals {
     rrSamples: HrSample[];
@@ -154,18 +154,21 @@ function computeHrStats(
     sleepEnd: string,
     baseDate: string,
     extra: ExtraVitals,
+    tz: string,
 ): SleepHrStats {
     // Parse sample timestamps — HAE returns "YYYY-MM-DD HH:MM:SS ±HHMM" in date field
     type ParsedSample = { ts: Date; bpm: number };
     const parsed: ParsedSample[] = hrSamples
-        .map((s) => ({ ts: parseTs(s.date), bpm: s.qty }))
+        .map((s) => ({ ts: parseTs(s.date), bpm: s.qty ?? s.Avg ?? 0 }))
         .filter((s) => !isNaN(s.ts.getTime()) && s.bpm > 20 && s.bpm < 220);
 
     // Filter to sleep window only
-    const nightStart = parseTs(`${baseDate} ${sleepStart}:00 +0200`);
-    // sleep_end may be next day — use nextDay if end < start (hour-wise)
-    const endDateStr = sleepEnd < sleepStart ? nextDay(baseDate) : baseDate;
-    const nightEnd   = parseTs(`${endDateStr} ${sleepEnd}:00 +0200`);
+    // The fetch window starts at 20:00 on baseDate — if sleepStart is before noon
+    // it crossed midnight and belongs to nextDay(baseDate).
+    const startDateStr = sleepStart < '12:00' ? nextDay(baseDate) : baseDate;
+    const nightStart = parseTs(`${startDateStr} ${sleepStart}:00 ${tz}`);
+    const endDateStr = sleepEnd < sleepStart ? nextDay(startDateStr) : startDateStr;
+    const nightEnd   = parseTs(`${endDateStr} ${sleepEnd}:00 ${tz}`);
 
     const nightSamples = parsed.filter(
         (s) => s.ts >= nightStart && s.ts <= nightEnd,
@@ -174,7 +177,7 @@ function computeHrStats(
     // Helper: filter any sample list to the sleep window and return values
     function nightVals(samples: HrSample[]): number[] {
         return samples
-            .map((s) => ({ ts: parseTs(s.date), v: s.qty }))
+            .map((s) => ({ ts: parseTs(s.date), v: s.qty ?? s.Avg ?? 0 }))
             .filter((s) => !isNaN(s.ts.getTime()) && s.ts >= nightStart && s.ts <= nightEnd)
             .map((s) => s.v);
     }
@@ -218,10 +221,11 @@ function computeHrStats(
         const bucket = stageBuckets[entry.stage];
         if (!bucket) continue;
         // Reconstruct absolute start/end — HH:MM strings, cross-midnight aware
-        const eStartDate = entry.start < sleepStart ? nextDay(baseDate) : baseDate;
-        const eEndDate   = entry.end   < sleepStart ? nextDay(baseDate) : baseDate;
-        const eStart = parseTs(`${eStartDate} ${entry.start}:00 +0200`);
-        const eEnd   = parseTs(`${eEndDate}   ${entry.end}:00 +0200`);
+        const eStartDate = entry.start < sleepStart ? nextDay(startDateStr) : startDateStr;
+        const eEndDate   = entry.end   < sleepStart ? nextDay(startDateStr) : startDateStr;
+        const eStart = parseTs(`${eStartDate} ${entry.start}:00 ${tz}`);
+        const eEnd   = parseTs(`${eEndDate}   ${entry.end}:00 ${tz}`);
+        
         for (const s of parsed) {
             if (s.ts >= eStart && s.ts <= eEnd) bucket.push(s.bpm);
         }
@@ -312,29 +316,37 @@ export function registerSleepTool(server: McpServer): void {
             const start   = `${night} 20:00:00 ${tz}`;
             const end     = `${morning} 12:00:00 ${tz}`;
 
-            // Fetch sleep + optionally HR in parallel
             type MetricsResponse = {
                 result?: { data?: { metrics?: Array<{ name: string; data: (RawInterval & { qty?: number })[] }> } };
             };
 
-            const metricsToFetch = withHr
-                ? 'sleep_analysis,heart_rate,respiratory_rate,oxygen_saturation,heart_rate_variability'
-                : 'sleep_analysis';
-            const raw = await callTCPRaw('health_metrics', {
-                start,
-                end,
-                metrics: metricsToFetch,
-                interval: withHr ? 'minutes' : 'hours',
+            // Fetch sleep_analysis (hours) and vitals (minutes) in two separate parallel calls
+            // to avoid HAE silently dropping metrics when interval mixes don't work
+            const fetchSleep = callTCPRaw('health_metrics', {
+                start, end,
+                metrics: 'sleep_analysis',
+                interval: 'hours',
                 aggregate: false,
             });
+            const fetchVitals = withHr
+                ? callTCPRaw('health_metrics', {
+                    start, end,
+                    metrics: 'heart_rate,respiratory_rate,oxygen_saturation,heart_rate_variability',
+                    interval: 'minutes',
+                    aggregate: false,
+                })
+                : Promise.resolve(null);
 
-            const resp     = raw as MetricsResponse;
-            const metricsArr = resp.result?.data?.metrics ?? [];
-            const sleepData  = metricsArr.find((m) => m.name === 'sleep_analysis')?.data ?? [];
-            const hrData     = metricsArr.find((m) => m.name === 'heart_rate')?.data ?? [];
-            const rrData     = metricsArr.find((m) => m.name === 'respiratory_rate')?.data ?? [];
-            const spo2Data   = metricsArr.find((m) => m.name === 'oxygen_saturation')?.data ?? [];
-            const hrvData    = metricsArr.find((m) => m.name === 'heart_rate_variability')?.data ?? [];
+            const [rawSleep, rawVitals] = await Promise.all([fetchSleep, fetchVitals]);
+
+            const sleepMetrics = (rawSleep as MetricsResponse).result?.data?.metrics ?? [];
+            const vitalsMetrics = rawVitals ? (rawVitals as MetricsResponse).result?.data?.metrics ?? [] : [];
+
+            const sleepData  = sleepMetrics.find((m) => m.name === 'sleep_analysis')?.data ?? [];
+            const hrData     = vitalsMetrics.find((m) => m.name === 'heart_rate')?.data ?? [];
+            const rrData     = vitalsMetrics.find((m) => m.name === 'respiratory_rate')?.data ?? [];
+            const spo2Data   = vitalsMetrics.find((m) => m.name === 'oxygen_saturation')?.data ?? [];
+            const hrvData    = vitalsMetrics.find((m) => m.name === 'heart_rate_variability')?.data ?? [];
 
             if (sleepData.length === 0) {
                 return {
@@ -360,6 +372,7 @@ export function registerSleepTool(server: McpServer): void {
                         spo2Samples: spo2Data as unknown as HrSample[],
                         hrvSamples:  hrvData  as unknown as HrSample[],
                     },
+                    tz,
                 );
             }
 
