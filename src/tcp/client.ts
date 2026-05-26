@@ -1,8 +1,9 @@
 import * as net from 'net';
-import { HAE_HOST, HAE_PORT, DEFAULT_TIMEOUT } from '../config.js';
+import { HAE_HOSTS, HAE_PORT, DEFAULT_TIMEOUT, CONNECT_TIMEOUT } from '../config.js';
 
-// Wraps the response in an MCP content block (used by simple proxy tools).
-export async function sendRequest(
+// Internal: attempt sendRequest on a single host; rejects on connection failure.
+function singleHostRequest(
+    host: string,
     toolName: string,
     args: Record<string, unknown>,
 ): Promise<{ content: Array<{ type: 'text'; text: string }> }> {
@@ -16,14 +17,17 @@ export async function sendRequest(
 
     const message = JSON.stringify(jsonrpcRequest);
 
-    return new Promise((resolve) => {
+    return new Promise((resolve, reject) => {
         const client = new net.Socket();
         let responseData = '';
         let hasResponded = false;
+        let connected = false;
 
-        client.setTimeout(DEFAULT_TIMEOUT);
+        client.setTimeout(CONNECT_TIMEOUT);
 
-        client.connect(HAE_PORT, HAE_HOST, () => {
+        client.connect(HAE_PORT, host, () => {
+            connected = true;
+            client.setTimeout(DEFAULT_TIMEOUT);
             client.write(message);
         });
 
@@ -68,14 +72,7 @@ export async function sendRequest(
                         resolve({ content: [{ type: 'text', text: responseData }] });
                     }
                 } else {
-                    resolve({
-                        content: [
-                            {
-                                type: 'text',
-                                text: `Failed to connect to Health Auto Export at ${HAE_HOST}:${HAE_PORT}: ${error.message}`,
-                            },
-                        ],
-                    });
+                    reject(error);
                 }
             }
         });
@@ -84,14 +81,18 @@ export async function sendRequest(
             if (!hasResponded) {
                 hasResponded = true;
                 client.destroy();
-                resolve({
-                    content: [
-                        {
-                            type: 'text',
-                            text: `Request to Health Auto Export timed out after ${DEFAULT_TIMEOUT}ms`,
-                        },
-                    ],
-                });
+                if (!connected) {
+                    reject(new Error(`Connection to ${host}:${HAE_PORT} timed out`));
+                } else {
+                    resolve({
+                        content: [
+                            {
+                                type: 'text',
+                                text: `Request to Health Auto Export timed out after ${DEFAULT_TIMEOUT}ms`,
+                            },
+                        ],
+                    });
+                }
             }
         });
 
@@ -111,9 +112,36 @@ export async function sendRequest(
     });
 }
 
-// Returns the raw parsed JSON response (throws on error).
-// Used by tools that need to combine and process multiple data sources.
-export function callTCPRaw(toolName: string, args: Record<string, unknown>): Promise<unknown> {
+// Wraps the response in an MCP content block (used by simple proxy tools).
+// Tries each host in HAE_HOSTS in order, falling back on connection failure.
+export async function sendRequest(
+    toolName: string,
+    args: Record<string, unknown>,
+): Promise<{ content: Array<{ type: 'text'; text: string }> }> {
+    let lastError: Error | null = null;
+    for (const host of HAE_HOSTS) {
+        try {
+            return await singleHostRequest(host, toolName, args);
+        } catch (e) {
+            lastError = e as Error;
+        }
+    }
+    return {
+        content: [
+            {
+                type: 'text',
+                text: `Failed to connect to Health Auto Export at ${HAE_HOSTS.join(', ')}:${HAE_PORT}: ${lastError?.message}`,
+            },
+        ],
+    };
+}
+
+// Internal: attempt callTCPRaw on a single host; rejects on connection failure.
+function singleHostRaw(
+    host: string,
+    toolName: string,
+    args: Record<string, unknown>,
+): Promise<unknown> {
     const requestId = Math.floor(Math.random() * 1000);
     const message = JSON.stringify({
         jsonrpc: '2.0',
@@ -124,15 +152,38 @@ export function callTCPRaw(toolName: string, args: Record<string, unknown>): Pro
     return new Promise((resolve, reject) => {
         const client = new net.Socket();
         let raw = '';
-        client.setTimeout(DEFAULT_TIMEOUT);
-        client.connect(HAE_PORT, HAE_HOST, () => client.write(message));
+        let connected = false;
+        client.setTimeout(CONNECT_TIMEOUT);
+        client.connect(HAE_PORT, host, () => {
+            connected = true;
+            client.setTimeout(DEFAULT_TIMEOUT);
+            client.write(message);
+        });
         client.on('data', (d) => { raw += d.toString(); });
         client.on('end', () => {
             try { resolve(JSON.parse(raw)); } catch (e) { reject(e); }
         });
         client.on('error', reject);
-        client.on('timeout', () => { client.destroy(); reject(new Error('TCP timeout')); });
+        client.on('timeout', () => {
+            client.destroy();
+            reject(new Error(connected ? 'TCP timeout' : `Connection to ${host}:${HAE_PORT} timed out`));
+        });
     });
+}
+
+// Returns the raw parsed JSON response (throws on error).
+// Used by tools that need to combine and process multiple data sources.
+// Tries each host in HAE_HOSTS in order, falling back on connection failure.
+export async function callTCPRaw(toolName: string, args: Record<string, unknown>): Promise<unknown> {
+    let lastError: Error | null = null;
+    for (const host of HAE_HOSTS) {
+        try {
+            return await singleHostRaw(host, toolName, args);
+        } catch (e) {
+            lastError = e as Error;
+        }
+    }
+    throw lastError ?? new Error(`Failed to connect to any configured host`);
 }
 
 export async function healthCheck(

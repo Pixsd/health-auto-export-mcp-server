@@ -1,6 +1,6 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { HAE_HOST, HAE_PORT } from './config.js';
+import { HAE_HOSTS, HAE_PORT } from './config.js';
 import { healthCheck } from './tcp/client.js';
 import { registerAllTools } from './tools/index.js';
 import { initDb, closeDb } from './db/client.js';
@@ -28,20 +28,20 @@ async function main(): Promise<void> {
     // Background init — errors are non-fatal; tools that need DB will fail
     // gracefully if the connection is not yet established.
     initDb()
-        .then(() => {
+        .then(async () => {
             console.error('MongoDB connected and indexes ensured.');
-            console.error(`Performing health check to ${HAE_HOST}:${HAE_PORT}...`);
-            return healthCheck(HAE_HOST, HAE_PORT);
-        })
-        .then((isHealthy) => {
-            if (!isHealthy) {
-                console.error(
-                    `Health check warning: Cannot connect to ${HAE_HOST}:${HAE_PORT}. Ensure Health Auto Export iOS app is running with TCP server enabled.`,
-                );
-            } else {
-                console.error(
-                    `Health check passed: Successfully connected to ${HAE_HOST}:${HAE_PORT}`,
-                );
+            for (const host of HAE_HOSTS) {
+                console.error(`Performing health check to ${host}:${HAE_PORT}...`);
+                const isHealthy = await healthCheck(host, HAE_PORT);
+                if (!isHealthy) {
+                    console.error(
+                        `Health check warning: Cannot connect to ${host}:${HAE_PORT}. Ensure Health Auto Export iOS app is running with TCP server enabled.`,
+                    );
+                } else {
+                    console.error(
+                        `Health check passed: Successfully connected to ${host}:${HAE_PORT}`,
+                    );
+                }
             }
         })
         .catch((error) => {
